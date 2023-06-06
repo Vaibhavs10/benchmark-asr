@@ -1,6 +1,7 @@
 import argparse
 
 from transformers import pipeline
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from datasets import load_dataset, Audio
 import evaluate
 
@@ -23,8 +24,21 @@ def get_text(sample):
         return sample["normalized_text"]
     elif "transcript" in sample:
         return sample["transcript"]
+    elif "transcription" in sample:
+        return sample["transcription"]
     else:
-        raise ValueError(f"Sample: {sample.keys()} has no transcript.")
+        raise ValueError(
+            f"Expected transcript column of either 'text', 'sentence', 'normalized_text' or 'transcript'. Got sample of "
+            ".join{sample.keys()}. Ensure a text column name is present in the dataset."
+        )
+
+
+whisper_norm = BasicTextNormalizer()
+
+
+def normalise(batch):
+    batch["norm_text"] = whisper_norm(get_text(batch))
+    return batch
 
 
 def data(dataset):
@@ -37,20 +51,23 @@ def main(args):
     whisper_asr = pipeline(
         "automatic-speech-recognition", model=args.model_id, device=args.device
     )
-    whisper_asr.model.config.max_length = 128
 
-    whisper_norm = whisper_asr.tokenizer._normalize
-
-    def normalise(batch):
-        batch["norm_text"] = whisper_norm(get_text(batch))
-        return batch
+    whisper_asr.model.config.forced_decoder_ids = (
+        whisper_asr.tokenizer.get_decoder_prompt_ids(
+            language=args.language, task="transcribe"
+        )
+    )
 
     dataset = load_dataset(
-        args.dataset, args.config, split=args.split, streaming=True, use_auth_token=True
+        args.dataset,
+        args.config,
+        split=args.split,
+        streaming=args.streaming,
+        use_auth_token=True,
     )
 
     # Only uncomment for debugging
-    dataset = dataset.take(64)
+    dataset = dataset.take(args.max_eval_samples)
 
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
     dataset = dataset.map(normalise)
@@ -69,7 +86,6 @@ def main(args):
 
     print("WER:", wer)
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -82,23 +98,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
+        default="mozilla-foundation/common_voice_11_0",
         help="Dataset name to evaluate the `model_id`. Should be loadable with 🤗 Datasets",
     )
     parser.add_argument(
         "--config",
         type=str,
         required=True,
-        help="Config of the dataset. *E.g.* `'en'`  for Common Voice",
+        help="Config of the dataset. *E.g.* `'en'` for the English split of Common Voice",
     )
     parser.add_argument(
-        "--split", type=str, required=True, help="Split of the dataset. *E.g.* `'test'`"
+        "--split",
+        type=str,
+        default="test",
+        help="Split of the dataset. *E.g.* `'test'`",
     )
 
     parser.add_argument(
         "--device",
         type=int,
-        default=None,
+        default=-1,
         help="The device to run the pipeline on. -1 for CPU (default), 0 for the first GPU and so on.",
     )
     parser.add_argument(
@@ -106,6 +125,24 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="Number of samples to go through each streamed batch.",
+    )
+    parser.add_argument(
+        "--max_eval_samples",
+        type=int,
+        default=None,
+        help="Number of samples to be evaluated. Put a lower number e.g. 64 for testing this script.",
+    )
+    parser.add_argument(
+        "--streaming",
+        type=bool,
+        default=True,
+        help="Choose whether you'd like to download the entire dataset or stream it during the evaluation.",
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        required=True,
+        help="Two letter language code for the transcription language, e.g. use 'en' for English.",
     )
     args = parser.parse_args()
 
